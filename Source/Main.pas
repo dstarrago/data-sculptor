@@ -29,15 +29,48 @@ type
       function DataClass(const Val: extended): string;  virtual; abstract;
   end;
 
-  TDistribution = (diUniform, diNormal);
+  TDistribution = class
+    protected
+      function Sample: extended; virtual; abstract;
+      procedure SaveToStream(S: TStream); virtual; abstract;
+      procedure LoadFromStream(S: TStream); virtual; abstract;
+  end;
+
+  TUniformDistribution = class(TDistribution)
+    private
+      fMinValue: extended;
+      fMaxValue: extended;
+    public
+      constructor Create(const aMinVal, aMaxVal: extended);
+      function Sample: extended; override;
+      function IntSample: extended;
+      procedure SaveToStream(S: TStream); override;
+      procedure LoadFromStream(S: TStream); override;
+      procedure setMinValue(const val: extended);
+      procedure setMaxValue(const val: extended);
+      property MinValue: extended read fMinValue;
+      property MaxValue: extended read fMaxValue;
+  end;
+
+  TNormalDistribution = class(TDistribution)
+    private
+      fMean: extended;
+      fStdDev: extended;
+    public
+      constructor Create(const aMean, aStdDev: extended);
+      function Sample: extended; override;
+      procedure setMean(const val: extended);
+      procedure setStdDev(const val: extended);
+      procedure SaveToStream(S: TStream); override;
+      procedure LoadFromStream(S: TStream); override;
+      property Mean: extended read fMean;
+      property StdDev: extended read fStdDev;
+  end;
+
   TNumericAttr = class(TAttribute)
     private
       fDistribution: TDistribution;
-      fMinConstrained: boolean;
-      fMaxConstrained: boolean;
       fDiscretizationLevel: integer;
-      procedure SetMaxConstrained(const Value: boolean);
-      procedure SetMinConstrained(const Value: boolean);
     protected
       fMinValue: extended;
       fMaxValue: extended;
@@ -49,10 +82,9 @@ type
       procedure SetVal(const V: extended);  virtual; abstract;
       procedure SaveToStream(S: TStream); override;
       procedure LoadFromStream(S: TStream); override;
+      procedure ComputeValues();
       function ClassVal(const Ind: integer): string;  override;
       function DataClass(const Val: extended): string;  override;
-      property MinConstrained: boolean read fMinConstrained write SetMinConstrained;
-      property MaxConstrained: boolean read fMaxConstrained write SetMaxConstrained;
       property Distribution: TDistribution read fDistribution write fDistribution;
       property MinValue: extended read fMinValue write fMinValue;
       property MaxValue: extended read fMaxValue write fMaxValue;
@@ -127,6 +159,7 @@ type
     private
       fInputAttrs: TList;
       fOutputAttr: TAttribute;
+      fNoise: integer;
       fWeights: TWeights;
       fNormWeights: array of extended;
       fSamples: array of extended;
@@ -401,7 +434,7 @@ function IsUnknown(const V: extended): boolean;
 
 implementation
 
-uses UnitAttrReal, UnitAttrSymbolic, UnitAttrEntero, Math, UnitAnalyzer, cMatrix;
+uses SymbolicAttr, NumericAttr, Analyzer, Math, cMatrix;
 
 type
   Int32 = -2147483648..2147483647;
@@ -409,7 +442,7 @@ type
 
 const
   SYMBOLS = 'ABCDEFGHIJKLMNOPQRSTUVXYZabcdefghijklmnopqrstuvxyz1234567890';
-  MainFormTitle = 'Diseñador de Datos';
+  MainFormTitle = 'Dataset Designer';
   DefaultInstancesNumber = 10;
   Comment = '%';
   Separators = [' ', ',', Comment, #9, ':'];
@@ -608,6 +641,8 @@ procedure TDataSet.GenerateAttr(Ai: integer);
 var
   Xi: integer;
 begin
+  if Attribute[Ai] is TNumericAttr
+    then TNumericAttr(Attribute[Ai]).ComputeValues;
   SetLength(fDataStore[Ai], InstanceNumber);
   if Attribute[Ai].Linker.Independent
     then
@@ -677,7 +712,11 @@ var
 begin
   SetLength(fDataStore, fAttributes.Count);
   for Ai := 0 to pred(fAttributes.Count) do
-    GenerateAttr(Ai);
+    if Attribute[Ai].Linker.Independent
+      then GenerateAttr(Ai);
+  for Ai := 0 to pred(fAttributes.Count) do
+    if not Attribute[Ai].Linker.Independent
+      then GenerateAttr(Ai);
   Insufflated := true;
 end;
 
@@ -705,6 +744,9 @@ begin
       fAttributes.Add(A);
       A.LoadFromStream(S);
     end;
+  // Load dependencies - TLink
+  for i := 0 to pred(fAttributes.Count) do
+    Attribute[i].Linker.LoadFromStream(S);
   if Insufflated then
     begin
       SetLength(fDataStore, ACount);
@@ -717,6 +759,33 @@ begin
     end;
 end;
 
+procedure TDataSet.SaveToStream(S: TStream);
+var
+  i: integer;
+  CN: string;
+  L: integer;
+begin
+  S.WriteBuffer(fInstanceNumber, SizeOf(fInstanceNumber));
+  S.WriteBuffer(AttrGenNumber, SizeOf(AttrGenNumber));
+  S.WriteBuffer(Insufflated, SizeOf(Insufflated));
+  S.WriteBuffer(fAttributes.Count, SizeOf(fAttributes.Count));
+  for i := 0 to pred(fAttributes.Count) do
+    begin
+      CN := Attribute[i].ClassName;
+      L := Length(CN);
+      S.WriteBuffer(L, SizeOf(L));
+      S.WriteBuffer(Pointer(CN)^, L);
+      Attribute[i].SaveToStream(S);
+    end;
+  // Save dependencies - TLink
+  for i := 0 to pred(fAttributes.Count) do
+    Attribute[i].Linker.SaveToStream(S);
+  if Insufflated then
+    for i := 0 to pred(fAttributes.Count) do
+      S.WriteBuffer(Pointer(fDataStore[i])^, fInstanceNumber * SizeOf(extended));
+  //  S.WriteBuffer(Pointer(DataStore)^, fInstanceNumber * AttributesCount * SizeOf(extended));
+end;
+
 function TDataSet.NewAttrName: string;
 begin
   Result := 'A' + IntToStr(AttrGenNumber);
@@ -726,22 +795,6 @@ end;
 function TDataSet.PosAttr(Attr: TAttribute): integer;
 begin
   Result := fAttributes.IndexOf(Attr);
-end;
-
-procedure TDataSet.SaveToStream(S: TStream);
-var
-  i: integer;
-begin
-  S.WriteBuffer(fInstanceNumber, SizeOf(fInstanceNumber));
-  S.WriteBuffer(AttrGenNumber, SizeOf(AttrGenNumber));
-  S.WriteBuffer(Insufflated, SizeOf(Insufflated));
-  S.WriteBuffer(fAttributes.Count, SizeOf(fAttributes.Count));
-  for i := 0 to pred(fAttributes.Count) do
-    Attribute[i].SaveToStream(S);
-  if Insufflated then
-    for i := 0 to pred(fAttributes.Count) do
-      S.WriteBuffer(Pointer(fDataStore[i])^, fInstanceNumber * SizeOf(extended));
-  //  S.WriteBuffer(Pointer(DataStore)^, fInstanceNumber * AttributesCount * SizeOf(extended));
 end;
 
 procedure TDataSet.SetDataStore(const Ai, Xi: integer;
@@ -877,12 +930,6 @@ begin
   Result := FSymbols.Strings[i];
 end;
 
-procedure TSymbolicAttr.LoadFromStream(S: TStream);
-begin
-  inherited;
-  S.ReadBuffer(FNumberOfSymbols, SizeOf(NumberOfSymbols));
-end;
-
 function TSymbolicAttr.PosSymbol(const S: string): integer;
 begin
   Result := FSymbols.IndexOf(S);
@@ -892,7 +939,7 @@ function TSymbolicAttr.Print: string;
 var
   i: integer;
 begin
-  Result := Name + ': Simbólico ( ';
+  Result := Name + ': Symbolic ( ';
   for i := 1 to pred(NumberOfSymbols) do
     Result := Result + GetDataAt(i) + ', ';
   Result := Result + GetDataAt(NumberOfSymbols) + ')';
@@ -904,15 +951,14 @@ begin
   Result := GetSymbol(Trunc(Sample));
 end;
 
-procedure TSymbolicAttr.SaveToStream(S: TStream);
-var
-  CN: string;
-  L: integer;
+procedure TSymbolicAttr.LoadFromStream(S: TStream);
 begin
-  CN := ClassName;
-  L := Length(CN);
-  S.WriteBuffer(L, SizeOf(L));
-  S.WriteBuffer(Pointer(CN)^, L);
+  inherited;
+  S.ReadBuffer(FNumberOfSymbols, SizeOf(NumberOfSymbols));
+end;
+
+procedure TSymbolicAttr.SaveToStream(S: TStream);
+begin
   inherited;
   S.WriteBuffer(FNumberOfSymbols, SizeOf(NumberOfSymbols));
 end;
@@ -961,7 +1007,7 @@ begin
   S.ReadBuffer(L, SizeOf(L));
   SetString(Name, nil, L);
   S.ReadBuffer(Pointer(Name)^, L);
-  Linker.LoadFromStream(S);
+///  Linker.LoadFromStream(S);
 end;
 
 procedure TAttribute.SaveToStream(S: TStream);
@@ -971,7 +1017,7 @@ begin
   L := Length(Name);
   S.WriteBuffer(L, SizeOf(L));
   S.WriteBuffer(Pointer(Name)^, L);
-  Linker.SaveToStream(S);
+///  Linker.SaveToStream(S);
 end;
 
 { TRealAttr }
@@ -979,8 +1025,6 @@ end;
 constructor TRealAttr.Create(const aName: string; aDataSet: TDataSet);
 begin
   inherited;
-  MinConstrained := false;
-  MaxConstrained := false;
   MinSample := MaxValue;
   MaxSample := MinValue;
 end;
@@ -1000,14 +1044,17 @@ end;
 function TRealAttr.Print: string;
 begin
   Result := Name + ': Real';
-  if Distribution = diUniform
-    then Result := Result + '   U( '
-    else Result := Result + '   N( ';  if MinConstrained
-    then Result := Result + FloatToStr(MinValue) + ' ; '
-    else Result := Result + '-Inf ; ';
-  if MaxConstrained
-    then Result := Result + FloatToStr(MaxValue) + ' )'
-    else Result := Result + '+Inf )';
+  if Distribution is TNormalDistribution then
+    begin
+      Result := Result + '   N( ' +
+                FloatToStr(TNormalDistribution(Distribution).Mean) + '; ' +
+                FloatToStr(TNormalDistribution(Distribution).StdDev) + ' ) ';
+    end else
+    begin
+      Result := Result + '   U( ' +
+                FloatToStr(TUniformDistribution(Distribution).MinValue) + '; ' +
+                FloatToStr(TUniformDistribution(Distribution).MaxValue) + ' ) ';
+    end;
   Result := Result + Linker.Print;
 end;
 
@@ -1026,18 +1073,9 @@ begin
 end;
 
 function TRealAttr.Sample: extended;
-var
-  M, S: extended;
 begin
-  if Distribution = diUniform
-    then Result := MinValue + Random(Abs(Trunc(MaxValue) - Trunc(MinValue))) + Random
-    else
-      begin
-        M := Abs(MaxValue - MinValue)/2;
-        S := Sqrt(M);
-        Result := MinValue + RandG(M, S);
-      end;
-    SetVal(Result);
+  Result := fDistribution.Sample;
+  SetVal(Result);
 end;
 
 { TIntegerAttr }
@@ -1045,8 +1083,6 @@ end;
 constructor TIntegerAttr.Create(const aName: string; aDataSet: TDataSet);
 begin
   inherited;
-  MinConstrained := false;
-  MaxConstrained := false;
   MinSample := MaxValue;
   MaxSample := MinValue;
 end;
@@ -1085,16 +1121,18 @@ end;
 
 function TIntegerAttr.Print: string;
 begin
-  Result := Name + ': Entero';
-  if Distribution = diUniform
-    then Result := Result + '   U( '
-    else Result := Result + '   N( ';
-  if MinConstrained
-    then Result := Result + IntToStr(MinValue) + ' ; '
-    else Result := Result + '-Inf ; ';
-  if MaxConstrained
-    then Result := Result + IntToStr(MaxValue) + ' )'
-    else Result := Result + '+Inf )';
+  Result := Name + ': Integer';
+  if Distribution is TNormalDistribution then
+    begin
+      Result := Result + '   N( ' +
+                FloatToStr(TNormalDistribution(Distribution).Mean) + '; ' +
+                FloatToStr(TNormalDistribution(Distribution).StdDev) + ' ) ';
+    end else
+    begin
+      Result := Result + '   U( ' +
+                FloatToStr(TUniformDistribution(Distribution).MinValue) + '; ' +
+                FloatToStr(TUniformDistribution(Distribution).MaxValue) + ' ) ';
+    end;
   Result := Result + Linker.Print;
 end;
 
@@ -1113,47 +1151,60 @@ end;
 
 procedure TDataSetDesigner.EditReal(Attr: TRealAttr);
 begin
-  with FormReal do
+  with NumericForm do
     begin
-      if Attr.MinConstrained
-        then
-          begin
-            RadioMinVal.Checked := true;
-            EditRealValMin.Text := FloatToStr(Attr.MinValue);
-          end
-        else RadioMenosInf.Checked := true;
-      if Attr.MaxConstrained
-        then
-          begin
-            RadioMaxVal.Checked := true;
-            EditRealValMax.Text := FloatToStr(Attr.MaxValue);
-          end
-        else RadioMasInf.Checked := true;
-      ComboDistribution.ItemIndex := integer(Attr.Distribution);
+      AttrName.Text := Attr.Name;
+      if Attr.Distribution is TNormalDistribution then
+        begin
+          NormalDistButton.Checked := true;
+          UniformDistButton.Checked := false;
+          Mean.Text   := FloatToStr(TNormalDistribution(Attr.Distribution).Mean);
+          StdDev.Text := FloatToStr(TNormalDistribution(Attr.Distribution).StdDev);
+        end else
+        begin
+          NormalDistButton.Checked := false;
+          UniformDistButton.Checked := true;
+          MinVal.Text := FloatToStr(TUniformDistribution(Attr.Distribution).MinValue);
+          MaxVal.Text := FloatToStr(TUniformDistribution(Attr.Distribution).MaxValue);
+        end;
       RuidoEdit.Value := Attr.Linker.Noise;
       ListAttributes(VarList.Items, Attr);
       ListDependences(DepenList.Items, Attr);
-      SetTitle(Attr.Name);
+      Caption := 'Real Attribute ' + Attr.Name;
       if ShowModal = mrOK then
         begin
-          if RadioMinVal.Checked
-            then
-              begin
-                Attr.MinConstrained := true;
-                Attr.MinValue := StrToFloat(EditRealValMin.Text);
-              end
-            else Attr.MinConstrained := false;
-          if RadioMaxVal.Checked
-            then
-              begin
-                Attr.MaxConstrained := true;
-                Attr.MaxValue := StrToFloat(EditRealValMax.Text);
-              end
-            else Attr.MaxConstrained := false;
-          Attr.Distribution := TDistribution(ComboDistribution.ItemIndex);
+          Attr.Name := NumericForm.attrName.Text;
+          if NumericForm.NormalDistButton.Checked then
+            begin   // Normal distribution
+              if Attr.Distribution is TUniformDistribution then
+                begin
+                  Attr.Distribution.Destroy;
+                  Attr.Distribution := TNormalDistribution.Create(
+                                        StrToFloat(NumericForm.Mean.Text),
+                                        StrToFloat(NumericForm.StdDev.Text));
+                end else
+                begin
+                  TNormalDistribution(Attr.Distribution).setMean(StrToFloat(NumericForm.Mean.Text));
+                  TNormalDistribution(Attr.Distribution).setStdDev(StrToFloat(NumericForm.StdDev.Text));
+                end;
+            end else
+            begin   // Uniform distribution
+              if Attr.Distribution is TNormalDistribution then
+                begin
+                  Attr.Distribution.Destroy;
+                  Attr.Distribution := TUniformDistribution.Create(
+                                        StrToFloat(NumericForm.MinVal.Text),
+                                        StrToFloat(NumericForm.MaxVal.Text));
+                end else
+                begin
+                  TUniformDistribution(Attr.Distribution).setMinValue(StrToFloat(NumericForm.MinVal.Text));
+                  TUniformDistribution(Attr.Distribution).setMaxValue(StrToFloat(NumericForm.MaxVal.Text));
+                end;
+            end;
           UpdateDependences(DepenList.Items, Attr);
           Attr.Linker.Noise := RuidoEdit.Value;
           DataSet.Insufflated := false;
+          fFileModified := true;
         end;
     end;
 end;
@@ -1168,60 +1219,74 @@ end;
 
 procedure TDataSetDesigner.EditInteger(Attr: TIntegerAttr);
 begin
-  with FormEntero do
+  with NumericForm do
     begin
-      if Attr.MinConstrained
-        then
-          begin
-            RadioMinVal.Checked := true;
-            EditEnteroValMin.Value := Attr.MinValue;
-          end
-        else RadioMenosInf.Checked := true;
-      if Attr.MaxConstrained
-        then
-          begin
-            RadioMaxVal.Checked := true;
-            EditEnteroValMax.Value := Attr.MaxValue;
-          end
-        else RadioMasInf.Checked := true;
-      ComboDistribution.ItemIndex := integer(Attr.Distribution);
+      AttrName.Text := Attr.Name;
+      if Attr.Distribution is TNormalDistribution then
+        begin
+          NormalDistButton.Checked := true;
+          UniformDistButton.Checked := false;
+          Mean.Text   := FloatToStr(TNormalDistribution(Attr.Distribution).Mean);
+          StdDev.Text := FloatToStr(TNormalDistribution(Attr.Distribution).StdDev);
+        end else
+        begin
+          NormalDistButton.Checked := false;
+          UniformDistButton.Checked := true;
+          MinVal.Text := FloatToStr(TUniformDistribution(Attr.Distribution).MinValue);
+          MaxVal.Text := FloatToStr(TUniformDistribution(Attr.Distribution).MaxValue);
+        end;
       RuidoEdit.Value := Attr.Linker.Noise;
       ListAttributes(VarList.Items, Attr);
       ListDependences(DepenList.Items, Attr);
-      SetTitle(Attr.Name);
+      Caption := 'Integer Attribute ' + Attr.Name;
       if ShowModal = mrOK then
         begin
-          if RadioMinVal.Checked
-            then
-              begin
-                Attr.MinConstrained := true;
-                Attr.MinValue := EditEnteroValMin.Value;
-              end
-            else Attr.MinConstrained := false;
-          if RadioMaxVal.Checked
-            then
-              begin
-                Attr.MaxConstrained := true;
-                Attr.MaxValue := EditEnteroValMax.Value;
-              end
-            else Attr.MaxConstrained := false;
-          Attr.Distribution := TDistribution(ComboDistribution.ItemIndex);
+          Attr.Name := NumericForm.attrName.Text;
+          if NumericForm.NormalDistButton.Checked then
+            begin   // Normal distribution
+              if Attr.Distribution is TUniformDistribution then
+                begin
+                  Attr.Distribution.Destroy;
+                  Attr.Distribution := TNormalDistribution.Create(
+                                        StrToFloat(NumericForm.Mean.Text),
+                                        StrToFloat(NumericForm.StdDev.Text));
+                end else
+                begin
+                  TNormalDistribution(Attr.Distribution).setMean(StrToFloat(NumericForm.Mean.Text));
+                  TNormalDistribution(Attr.Distribution).setStdDev(StrToFloat(NumericForm.StdDev.Text));
+                end;
+            end else
+            begin   // Uniform distribution
+              if Attr.Distribution is TNormalDistribution then
+                begin
+                  Attr.Distribution.Destroy;
+                  Attr.Distribution := TUniformDistribution.Create(
+                                        StrToFloat(NumericForm.MinVal.Text),
+                                        StrToFloat(NumericForm.MaxVal.Text));
+                end else
+                begin
+                  TUniformDistribution(Attr.Distribution).setMinValue(StrToFloat(NumericForm.MinVal.Text));
+                  TUniformDistribution(Attr.Distribution).setMaxValue(StrToFloat(NumericForm.MaxVal.Text));
+                end;
+            end;
           UpdateDependences(DepenList.Items, Attr);
           Attr.Linker.Noise := RuidoEdit.Value;
           DataSet.Insufflated := false;
+          fFileModified := true;
         end;
     end;
 end;
 
 procedure TDataSetDesigner.EditSymbolic(Attr: TSymbolicAttr);
 begin
-  with FormSimbolico do
+  with SymbolicForm do
     begin
+      attrName.Text := Attr.Name;
       EditSimbolico.Value :=Attr.NumberOfSymbols;
       RuidoEdit.Value := Attr.Linker.Noise;
       ListAttributes(VarList.Items, Attr);
       ListDependences(DepenList.Items, Attr);
-      SetTitle(Attr.Name);
+      Caption := 'Symbolic Attribute ' + Attr.Name;
       if ShowModal = mrOK then
         begin
           Attr.NumberOfSymbols := EditSimbolico.Value;
@@ -1262,29 +1327,93 @@ end;
 
 procedure TDataSetDesigner.NewRealExecute(Sender: TObject);
 var
-  Attr: TAttribute;
+  Dist: TDistribution;
+  Attr: TRealAttr;
 begin
-  Attr := DataSet.AddRealAttribute;
-  ListAttr.AddItem(Attr.Print, Attr);
-  fFileModified := true;
+  ListAttributes(NumericForm.VarList.Items, nil);
+  NumericForm.DepenList.Clear;
+  NumericForm.AttrName.Text := '';
+  NumericForm.Caption := 'New Real Attribute';
+  if NumericForm.ShowModal = mrOK then
+    begin
+      Attr := DataSet.AddRealAttribute;
+      Attr.Name := NumericForm.attrName.Text;
+      if NumericForm.NormalDistButton.Checked then
+        begin   // Normal distribution
+          Dist := TNormalDistribution.Create(
+                        StrToFloat(NumericForm.Mean.Text),
+                        StrToFloat(NumericForm.StdDev.Text));
+        end else
+        begin   // Uniform distribution
+          Dist := TUniformDistribution.Create(
+                        StrToFloat(NumericForm.MinVal.Text),
+                        StrToFloat(NumericForm.MaxVal.Text));
+        end;
+      Attr.Distribution := Dist;
+      UpdateDependences(NumericForm.DepenList.Items, Attr);
+      Attr.Linker.Noise := NumericForm.RuidoEdit.Value;
+      DataSet.Insufflated := false;
+      ListAttr.AddItem(Attr.Print, Attr);
+      fFileModified := true;
+    end;
 end;
 
 procedure TDataSetDesigner.NewIntExecute(Sender: TObject);
 var
-  Attr: TAttribute;
+  Dist: TDistribution;
+  Attr: TIntegerAttr;
 begin
-  Attr := DataSet.AddIntegerAttribute;
-  ListAttr.AddItem(Attr.Print, Attr);
-  fFileModified := true;
+  ListAttributes(NumericForm.VarList.Items, nil);
+  NumericForm.DepenList.Clear;
+  NumericForm.AttrName.Text := '';
+  NumericForm.Caption := 'New Integer Attribute';
+  if NumericForm.ShowModal = mrOK then
+    begin
+      Attr := DataSet.AddIntegerAttribute;
+      Attr.Name := NumericForm.attrName.Text;
+      if NumericForm.NormalDistButton.Checked then
+        begin   // Normal distribution
+          Dist := TNormalDistribution.Create(
+                        StrToFloat(NumericForm.Mean.Text),
+                        StrToFloat(NumericForm.StdDev.Text));
+        end else
+        begin   // Uniform distribution
+          Dist := TUniformDistribution.Create(
+                        StrToFloat(NumericForm.MinVal.Text),
+                        StrToFloat(NumericForm.MaxVal.Text));
+        end;
+      Attr.Distribution := Dist;
+      UpdateDependences(NumericForm.DepenList.Items, Attr);
+      Attr.Linker.Noise := NumericForm.RuidoEdit.Value;
+      DataSet.Insufflated := false;
+      ListAttr.AddItem(Attr.Print, Attr);
+      fFileModified := true;
+    end;
 end;
 
 procedure TDataSetDesigner.NewSymbolicExecute(Sender: TObject);
 var
-  Attr: TAttribute;
+  Attr: TSymbolicAttr;
 begin
-  Attr := DataSet.AddSymbolicAttribute;
-  ListAttr.AddItem(Attr.Print, Attr);
-  fFileModified := true;
+  ListAttributes(SymbolicForm.VarList.Items, nil);
+  NumericForm.DepenList.Clear;
+  NumericForm.AttrName.Text := '';
+  with SymbolicForm do
+    begin
+      attrName.Text := '';
+      Caption := 'New Symbolic Attribute';
+      if SymbolicForm.ShowModal = mrOK then
+        begin
+          Attr := DataSet.AddSymbolicAttribute;
+          Attr.Name := attrName.Text;
+          Attr.NumberOfSymbols := EditSimbolico.Value;
+          UpdateDependences(DepenList.Items, Attr);
+          Attr.Linker.Noise := RuidoEdit.Value;
+          DataSet.Insufflated := false;
+          ListAttr.AddItem(Attr.Print, Attr);
+          fFileModified := true;
+        end;
+    end;
 end;
 
 procedure TDataSetDesigner.EditAttrExecute(Sender: TObject);
@@ -1375,9 +1504,9 @@ procedure TDataSetDesigner.AnalyzeAllExecute(Sender: TObject);
 begin
   if DataSet.Insufflated then
     begin
-      FormAnalyzer.Memo.Clear;
-      FormAnalyzer.Execute(DataSet);
-      FormAnalyzer.Show;
+      AnalyzerForm.Memo.Clear;
+      AnalyzerForm.Execute(DataSet);
+      AnalyzerForm.Show;
     end;
 end;
 
@@ -1411,17 +1540,8 @@ begin
 end;
 
 function TIntegerAttr.Sample: extended;
-var
-  M, S: extended;
 begin
-  if Distribution = diUniform
-    then Result := MinValue + Random(Abs(MaxValue - MinValue) + 1)
-    else
-      begin
-        M := Abs(MaxValue - MinValue)/2;
-        S := Sqrt(M);
-        Result := MinValue + Trunc(RandG(M, S));
-      end;
+  Result := fDistribution.Sample;
   SetVal(Result);
 end;
 
@@ -1430,6 +1550,21 @@ end;
 function TNumericAttr.ClassVal(const Ind: integer): string;
 begin
   Result := IntToStr(Ind);
+end;
+
+procedure TNumericAttr.ComputeValues;
+begin
+  if Distribution is TUniformDistribution then
+  begin
+    fMinValue := TUniformDistribution(Distribution).MinValue;
+    fMaxValue := TUniformDistribution(Distribution).MaxValue;
+  end else
+  begin
+    fMinValue := TNormalDistribution(Distribution).Mean -
+                 3 * TNormalDistribution(Distribution).StdDev;
+    fMaxValue := TNormalDistribution(Distribution).Mean +
+                 3 * TNormalDistribution(Distribution).StdDev;
+  end;
 end;
 
 function TNumericAttr.DataClass(const Val: extended): string;
@@ -1448,11 +1583,23 @@ begin
 end;
 
 procedure TNumericAttr.LoadFromStream(S: TStream);
+var
+  N: string;
+  L: integer;
 begin
   inherited;
-  S.ReadBuffer(fDistribution, SizeOf(fDistribution));
-  S.ReadBuffer(fMinConstrained, SizeOf(fMinConstrained));
-  S.ReadBuffer(fMaxConstrained, SizeOf(fMaxConstrained));
+  S.ReadBuffer(L, SizeOf(L));    // Longitud del nombre de la clase
+  SetString(N, nil, L);
+  S.ReadBuffer(Pointer(N)^, L);
+  if N = 'TNormalDistribution' then
+    begin
+      fDistribution := TNormalDistribution.Create(0, 0);
+    end else
+    begin
+      fDistribution := TUniformDistribution.Create(0, 0);
+    end;
+  fDistribution.LoadFromStream(S);
+  S.ReadBuffer(fDiscretizationLevel, SizeOf(fDiscretizationLevel));
   S.ReadBuffer(fMinValue, SizeOf(fMinValue));
   S.ReadBuffer(fMaxValue, SizeOf(fMaxValue));
   S.ReadBuffer(fMinSample, SizeOf(fMinSample));
@@ -1462,17 +1609,16 @@ end;
 
 procedure TNumericAttr.SaveToStream(S: TStream);
 var
+  N: string;
   L: integer;
-  CN: string;
 begin
-  CN := ClassName;
-  L := Length(CN);
-  S.WriteBuffer(L, SizeOf(L));
-  S.WriteBuffer(Pointer(CN)^, L);
   inherited;
-  S.WriteBuffer(fDistribution, SizeOf(fDistribution));
-  S.WriteBuffer(fMinConstrained, SizeOf(fMinConstrained));
-  S.WriteBuffer(fMaxConstrained, SizeOf(fMaxConstrained));
+  N := fDistribution.ClassName;
+  L := Length(N);
+  S.WriteBuffer(L, SizeOf(L));
+  S.WriteBuffer(Pointer(N)^, L);
+  fDistribution.SaveToStream(S);
+  S.WriteBuffer(fDiscretizationLevel, SizeOf(fDiscretizationLevel));
   S.WriteBuffer(fMinValue, SizeOf(fMinValue));
   S.WriteBuffer(fMaxValue, SizeOf(fMaxValue));
   S.WriteBuffer(fMinSample, SizeOf(fMinSample));
@@ -1494,18 +1640,6 @@ begin
   if Range mod DataSet.InstanceNumber > 0
     then inc(Interval);
   }
-end;
-
-procedure TNumericAttr.SetMaxConstrained(const Value: boolean);
-begin
- fMaxConstrained := Value;
- fMaxValue := High(integer) / 2;
-end;
-
-procedure TNumericAttr.SetMinConstrained(const Value: boolean);
-begin
-  fMinConstrained := Value;
-  fMinValue := Low(integer) / 2;
 end;
 
 { TLinker }
@@ -1584,12 +1718,6 @@ begin
   i := fInputAttrs.IndexOf(Attr);
   if i >= 0 then fWeights[succ(i)] := Value;
   NormalizeWeights;
-end;
-
-function TLinker.SymToSym(AttrIn, AttrOut: TSymbolicAttr; const x: integer): extended;
-begin
-  Result := Trunc(1 + (AttrIn.FetchData(x) - 1)
-   * (AttrOut.NumberOfSymbols) / (AttrIn.NumberOfSymbols));
 end;
 
 procedure TLinker.UnlinkAttr(Attr: TAttribute);
@@ -1673,11 +1801,15 @@ end;
 procedure TDataSetDesigner.ListAttributes(List: TStrings; Attr: TAttribute);
 var
   i: integer;
+  A: TAttribute;
 begin
   List.Clear;
-  for i := 0 to pred(DataSet.PosAttr(Attr)) do
-    if not Attr.Linker.IsInput(DataSet.Attribute[i])
-      then List.AddObject(TAttribute(DataSet.Attribute[i]).Name, DataSet.Attribute[i]);
+  for i := 0 to pred(DataSet.AttributesCount) do
+    begin
+      A := DataSet.Attribute[i];
+      if (Attr = nil) or ((A <> Attr) and not Attr.Linker.IsInput(A))
+        then List.AddObject(A.Name, A);
+    end;
 end;
 
 procedure TDataSetDesigner.ListDependences(List: TStrings; Attr: TAttribute);
@@ -1745,7 +1877,7 @@ end;
 function TLinker.NumToNum(AttrIn, AttrOut: TNumericAttr; const x: integer): extended;
 begin
   Result := AttrOut.MinValue + (AttrIn.FetchData(x) - AttrIn.MinValue)
-   * (AttrOut.MaxValue - AttrOut.MinValue) / (AttrIn.MaxValue - AttrIn.MinValue);
+   * (AttrOut.MaxValue - AttrOut.MinValue) / (1 + (AttrIn.MaxValue - AttrIn.MinValue));
 end;
 
 function TLinker.SymToNum(AttrIn: TSymbolicAttr; AttrOut: TNumericAttr; const x: integer): extended;
@@ -1757,17 +1889,24 @@ end;
 function TLinker.NumToSym(AttrIn: TNumericAttr; AttrOut: TSymbolicAttr; const x: integer): extended;
 begin
   Result := Trunc(1 + (AttrIn.FetchData(x) - AttrIn.MinValue)
-   * (AttrOut.NumberOfSymbols) / (AttrIn.MaxValue - AttrIn.MinValue));
+  * (AttrOut.NumberOfSymbols) / (1 + abs(AttrIn.MaxValue - AttrIn.MinValue)));
+end;
+
+function TLinker.SymToSym(AttrIn, AttrOut: TSymbolicAttr; const x: integer): extended;
+begin
+  Result := Trunc(1 + (AttrIn.FetchData(x) - 1)
+   * (AttrOut.NumberOfSymbols) / (AttrIn.NumberOfSymbols));
 end;
 
 function TLinker.GetNoise: integer;
 begin
-  Result := fWeights[0];
+  Result := fNoise;
 end;
 
 procedure TLinker.SetNoise(const Value: integer);
 begin
-  fWeights[0] := Value;
+  fNoise := Value;
+  fWeights[0] := 100 - fNoise;
   NormalizeWeights;
 end;
 
@@ -1788,7 +1927,7 @@ begin
         Result := '     Depend:';
         for i := 0 to pred(InputCount) do
           Result :=  Result + '   ' + Weight[i] + '%  ' + Input[i].Name;
-        Result := Result + '     Ruido: ' + IntToStr(fWeights[0]) + '%';
+        Result := Result + '     Noise: ' + IntToStr(fNoise) + '%';
       end;
 end;
 
@@ -1796,9 +1935,9 @@ procedure TDataSetDesigner.InformationTheoreticAnalysisExecute(Sender: TObject);
 begin
   if DataSet.Insufflated then
     begin
-      FormAnalyzer.Memo.Clear;
-      FormAnalyzer.InformationTheoryAnalysis(DataSet);
-      FormAnalyzer.Show;
+      AnalyzerForm.Memo.Clear;
+      AnalyzerForm.InformationTheoryAnalysis(DataSet);
+      AnalyzerForm.Show;
     end;
 end;
 
@@ -1806,9 +1945,9 @@ procedure TDataSetDesigner.RoughSetsAnalysisExecute(Sender: TObject);
 begin
   if DataSet.Insufflated then
     begin
-      FormAnalyzer.Memo.Clear;
-      FormAnalyzer.RoughSetAnalysis(DataSet);
-      FormAnalyzer.Show;
+      AnalyzerForm.Memo.Clear;
+      AnalyzerForm.RoughSetAnalysis(DataSet);
+      AnalyzerForm.Show;
     end;
 end;
 
@@ -1818,15 +1957,15 @@ begin
   if ViewAnalysisSheet.Checked
     then
       begin
-        FormAnalyzer.WindowState := wsMaximized;
-        FormAnalyzer.Show;
+        AnalyzerForm.WindowState := wsMaximized;
+        AnalyzerForm.Show;
       end
-    else FormAnalyzer.Hide;
+    else AnalyzerForm.Hide;
 end;
 
 procedure TDataSetDesigner.CleanAnalysisSheetExecute(Sender: TObject);
 begin
-  FormAnalyzer.Memo.Clear;
+  AnalyzerForm.Memo.Clear;
 end;
 
 procedure TDataSetDesigner.SaveToFile(const FileName: string);
@@ -1843,6 +1982,7 @@ var
   i, L: integer;
   N: string;
 begin
+  S.WriteBuffer(fNoise, SizeOf(fNoise));
   S.WriteBuffer(fInputAttrs.Count, SizeOf(fInputAttrs.Count));
   for i := 0 to pred(fInputAttrs.Count) do
     begin
@@ -1852,6 +1992,26 @@ begin
       S.WriteBuffer(Pointer(N)^, L);
     end;
   S.WriteBuffer(Pointer(fWeights)^, Length(fWeights) * SizeOf(integer));
+end;
+
+procedure TLinker.LoadFromStream(S: TStream);
+var
+  C, i, L: integer;
+  N: string;
+begin
+  S.ReadBuffer(fNoise, SizeOf(fNoise));
+  S.ReadBuffer(C, SizeOf(C));       // fInputAttrs.Count
+  for i := 0 to pred(C) do
+    begin
+      S.ReadBuffer(L, SizeOf(L));
+      SetString(N, nil, L);
+      S.ReadBuffer(Pointer(N)^, L);
+      fInputAttrs.Add(fOutputAttr.DataSet.FindAttr(N));
+    end;
+  SetLength(fWeights, succ(C));
+  SetLength(fNormWeights, succ(C));
+  S.ReadBuffer(Pointer(fWeights)^, Length(fWeights) * SizeOf(integer));
+  NormalizeWeights;
 end;
 
 procedure TDataSetDesigner.LoadFromFile(const FileName: string);
@@ -1865,26 +2025,6 @@ begin
   UpdateDisplay;
   if DataSet.Insufflated
     then ExportDataSet(MemData.Lines);
-end;
-
-procedure TLinker.LoadFromStream(S: TStream);
-var
-  C, i, L: integer;
-  N: string;
-begin
-  S.ReadBuffer(C, SizeOf(C));
-  for i := 0 to pred(C) do
-    begin
-      S.ReadBuffer(L, SizeOf(L));
-      SetString(N, nil, L);
-      S.ReadBuffer(Pointer(N)^, L);
-      fInputAttrs.Add(fOutputAttr.DataSet.FindAttr(N));
-    end;
-  SetLength(fWeights, succ(C));
-  SetLength(fNormWeights, succ(C));
-  S.ReadBuffer(Pointer(fWeights)^, Length(fWeights) * SizeOf(integer));
-  NormalizeWeights;
-  //S.ReadBuffer(Pointer(fNormWeights)^, Length(fNormWeights) * SizeOf(extended));
 end;
 
 procedure TDataSetDesigner.SaveAsExecute(Sender: TObject);
@@ -2005,9 +2145,9 @@ procedure TDataSetDesigner.BasicAnalysisExecute(Sender: TObject);
 begin
   if DataSet.Insufflated then
     begin
-      FormAnalyzer.Memo.Clear;
-      FormAnalyzer.BasicMeasures(DataSet);
-      FormAnalyzer.Show;
+      AnalyzerForm.Memo.Clear;
+      AnalyzerForm.BasicMeasures(DataSet);
+      AnalyzerForm.Show;
     end;
 end;
 
@@ -2015,9 +2155,9 @@ procedure TDataSetDesigner.StatisticAnalysisExecute(Sender: TObject);
 begin
   if DataSet.Insufflated then
     begin
-      FormAnalyzer.Memo.Clear;
-      FormAnalyzer.StatisticAnalysis(DataSet);
-      FormAnalyzer.Show;
+      AnalyzerForm.Memo.Clear;
+      AnalyzerForm.StatisticAnalysis(DataSet);
+      AnalyzerForm.Show;
     end;
 end;
 
@@ -2387,6 +2527,95 @@ begin
       UpdateDisplay;
       fFileModified := true;
     end;
+end;
+
+{ TUniformDistribution }
+
+constructor TUniformDistribution.Create(const aMinVal, aMaxVal: extended);
+begin
+  fMinValue := aMinVal;
+  fMaxValue := aMaxVal;
+end;
+
+function TUniformDistribution.Sample: extended;
+var
+  mean, sd: extended;
+  s: extended;
+begin
+  mean := (fMinValue + fMaxValue) / 2.0;
+  sd := fMaxValue - fMinValue;
+  s := RandG(mean, sd);
+  if s > fMaxValue
+    then s := mean + (Frac(abs(s)/(fMaxValue - mean)))*(fMaxValue - mean);
+  if s < fMinValue
+    then s := mean - (Frac(abs(s)/(mean - fMinValue)))*(mean - fMinValue);
+  Result := s;
+end;
+
+function TUniformDistribution.IntSample: extended;
+begin
+  Result := RandomRange(round(fMinValue), round(fMaxValue));
+end;
+
+procedure TUniformDistribution.setMaxValue(const val: extended);
+begin
+  fMaxValue := val;
+end;
+
+procedure TUniformDistribution.setMinValue(const val: extended);
+begin
+  fMinValue := val;
+end;
+
+procedure TUniformDistribution.LoadFromStream(S: TStream);
+begin
+  inherited;
+  S.ReadBuffer(fMinValue, SizeOf(fMinValue));
+  S.ReadBuffer(fMaxValue, SizeOf(fMaxValue));
+end;
+
+procedure TUniformDistribution.SaveToStream(S: TStream);
+begin
+  inherited;
+  S.WriteBuffer(fMinValue, SizeOf(fMinValue));
+  S.WriteBuffer(fMaxValue, SizeOf(fMaxValue));
+end;
+
+{ TNormalDistribution }
+
+constructor TNormalDistribution.Create(const aMean, aStdDev: extended);
+begin
+  fMean := aMean;
+  fStdDev := aStdDev;
+end;
+
+procedure TNormalDistribution.LoadFromStream(S: TStream);
+begin
+  inherited;
+  S.ReadBuffer(fMean, SizeOf(fMean));
+  S.ReadBuffer(fStdDev, SizeOf(fStdDev));
+end;
+
+function TNormalDistribution.Sample: extended;
+begin
+  Result := RandG(fMean, fStdDev);
+end;
+
+procedure TNormalDistribution.SaveToStream(S: TStream);
+begin
+  inherited;
+  S.WriteBuffer(fMean, SizeOf(fMean));
+  S.WriteBuffer(fStdDev, SizeOf(fStdDev));
+end;
+
+procedure TNormalDistribution.setMean(const val: extended);
+begin
+  fMean := val;
+end;
+
+procedure TNormalDistribution.setStdDev(const val: extended);
+begin
+  fStdDev := val;
 end;
 
 end.
